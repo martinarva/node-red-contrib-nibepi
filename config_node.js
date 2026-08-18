@@ -2,7 +2,7 @@ module.exports = function(RED) {
     const EventEmitter = require('events').EventEmitter;
     require('events').EventEmitter.defaultMaxListeners = 800;
     const https = require('https');
-    //const http = require('http');
+    const http = require('http');
     const nibeData = new EventEmitter()
     const nibe = require('nibepi')
     var serialPort = "";
@@ -19,6 +19,110 @@ module.exports = function(RED) {
     let priceOffset = {};
     let savedGraph = {};
     let savedData = {};
+
+    // ======== HARD-CODED HA SETTINGS (edit these) ========
+    const HA_BASE_URL = "http://192.168.1.35:8123";
+    const HA_TOKEN    = process.env.HA_TOKEN || "";  // NB: set via the environment, never hardcode it here
+    const HA_ENTITY   = "sensor.nordpool_import";
+    const PRICE_TO_CENTS_MULTIPLIER = 100;
+
+
+    // Small helper to GET the HA entity state+attributes (with verbose logging)
+    function fetchHAEntity(entityId) {
+    return new Promise((resolve, reject) => {
+        const url = `${HA_BASE_URL}/api/states/${encodeURIComponent(entityId)}`;
+        const u = new URL(url);
+
+        // 1) Call started
+        if (nibe && typeof nibe.log === "function") {
+        nibe.log(`HA fetch start: ${u.href}`, "price", "debug");
+        }
+
+        const options = {
+        hostname: u.hostname,
+        port: u.port || (u.protocol === "https:" ? 443 : 80),
+        path: u.pathname + (u.search || ""),
+        method: "GET",
+        headers: { "Authorization": `Bearer ${HA_TOKEN}`, "Accept": "application/json" },
+        timeout: 8000
+        };
+
+        const client = (u.protocol === "https:") ? require("https") : require("http");
+        const req = client.request(options, (res) => {
+        // 2) Got response
+        if (nibe && typeof nibe.log === "function") {
+            nibe.log(`HA response: ${res.statusCode} ${res.statusMessage || ""}`, "price", "debug");
+        }
+
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+            try {
+            if (res.statusCode !== 200) {
+                if (nibe && typeof nibe.log === "function") {
+                nibe.log(`HA non-200 body (first 200): ${String(data).slice(0,200)}`, "price", "debug");
+                }
+                return reject(new Error(`HA ${res.statusCode}: ${res.statusMessage || ""}`));
+            }
+
+            // 3) Try parse
+            let obj;
+            try {
+                obj = JSON.parse(data);
+            } catch (e) {
+                if (nibe && typeof nibe.log === "function") {
+                nibe.log(`HA JSON parse error: ${e.message}. Raw (first 200): ${String(data).slice(0,200)}`, "price", "error");
+                }
+                return reject(e);
+            }
+
+            // 4) Join raw_today + raw_tomorrow -> raw_all
+            const attrs = obj && obj.attributes ? obj.attributes : (obj.attributes = {});
+            const today    = Array.isArray(attrs.raw_today) ? attrs.raw_today : [];
+            const tomorrow = Array.isArray(attrs.raw_tomorrow) ? attrs.raw_tomorrow : [];
+            attrs.raw_all  = [...today, ...tomorrow].filter(p => p && p.start);
+
+            attrs.raw_all.sort((a, b) => new Date(a.start) - new Date(b.start));
+
+            // 5) Log the join result
+            if (nibe && typeof nibe.log === "function") {
+                const windowStr = attrs.raw_all.length
+                ? `${attrs.raw_all[0].start} → ${attrs.raw_all[attrs.raw_all.length - 1].end || attrs.raw_all[attrs.raw_all.length - 1].start}`
+                : "(empty)";
+                nibe.log(
+                `HA join: today=${today.length}, tomorrow=${tomorrow.length}, total=${attrs.raw_all.length}, window=${windowStr}`,
+                "price", "debug"
+                );
+            }
+
+            resolve(obj);
+            } catch (e) {
+            if (nibe && typeof nibe.log === "function") {
+                nibe.log(`HA fetch processing error: ${e.message}`, "price", "error");
+            }
+            reject(e);
+            }
+        });
+        });
+
+        req.on("timeout", () => {
+        if (nibe && typeof nibe.log === "function") {
+            nibe.log("HA request timed out", "price", "error");
+        }
+        req.destroy(new Error("HA request timed out"));
+        });
+
+        req.on("error", (err) => {
+        if (nibe && typeof nibe.log === "function") {
+            nibe.log(`HA request error: ${err.message}`, "price", "error");
+        }
+        reject(err);
+        });
+
+        req.end();
+    });
+    }    
+
     const SunCalc = require('suncalc');
     const suncalc = (data) => {
         var times = SunCalc.getTimes(data.timestamp, data.lat, data.lon);
@@ -1305,7 +1409,7 @@ module.exports = function(RED) {
         let result = {values:sendArray,system:system};
         return result;
     }
-    async function runPrice(data,array) {
+    async function runPriceOld(data,array) {
         
         nibe.log(`Startar elprisreglering runPrice()`,'price','debug');
         //let data = Object.assign({}, result);
@@ -1406,158 +1510,519 @@ module.exports = function(RED) {
                 data.price_current = await getNibeData(hP['price_current']).catch(console.log);
                 nibeData.emit('pluginPriceGraph',nibeBuildGraph(data,data.system));
                 nibeData.emit('pluginPrice',data);
-            } else if(config.price.source=="priceai") {
-                nibe.log(`Källan är AI`,'price','debug');
-                
-                if(config.price.token!==undefined && config.price.token!=="") {
-                    let token = config.price.token;
-                    
-                    
-                    try {
-                        const optionsHeat = {
-                            hostname: 'nibepi.anerdins.se',
-                            port: 8443,
-                            path: '/api/optimize/heat',
-                            rejectUnauthorized: false,
-                            requestCert: true,
-                            agent: false,
-                            method: 'POST',
-                            headers: {
-                                'Authorization': `Bearer ${token}`,
-                                'Content-Type': 'application/json'
-                            }
-                        };
-                        const optionsHW = {
-                        hostname: 'nibepi.anerdins.se',
-                        port: 8443,
-                        path: '/api/optimize/battery',
-                        rejectUnauthorized: false,
-                        requestCert: true,
-                        agent: false,
-                        method: 'POST',
-                        headers: {
-                            'Authorization': `Bearer ${token}`,
-                            'Content-Type': 'application/json'
-                        }
-                      };
-                      var cheap_setting = undefined
-                      var expensive_setting = undefined
-                      if(config.price.enable_own_setting===true) {
-                        cheap_setting = config.price.verycheap
-                        expensive_setting = config.price.veryexpensive
-                      }
-                        const requestHeat = JSON.stringify({
-                            name:"heat",
-                            id:config.system.id,
-                            area:config.price.area,
-                            time:config.price.time,
-                            json:true,
-                            min_spread:config.price.min_spread,
-                            veryCheap:cheap_setting,
-                            veryExpensive:expensive_setting
-                        });
-                        if(config.price.time_hw===undefined) config.price.time_hw = config.price.time
-                        const requestHW = JSON.stringify({
-                            name:"hw",
-                            id:config.system.id,
-                            area:config.price.area,
-                            time:config.price.time_hw,
-                            ratio:config.price.ratio,
-                            json:true,
-                            min_spread:config.price.min_spread,
-                            veryCheap:cheap_setting,
-                            veryExpensive:expensive_setting
-                        });
-                        const heatSettings = await getCloudData(optionsHeat,requestHeat)
-                        const hwSettings = await getCloudData(optionsHW,requestHW)
-                        Promise.all([heatSettings, hwSettings]).then(async (values) => {
-                            nibe.log(`Data hämtad från AI`,'price','debug');
-                            var heat = values[0]
-                            var hw = values[1]
-                            data.priceai = {heat,hw};
-                            data.price_current = {};
-                            data.price_current.data = Number((heat.current).toFixed(2))
-                            data.price_current.raw_data = Number((heat.current).toFixed(2))
-                            data.heat_price_level = {};
-                            data.heat_price_level.data = heat.level;
-                            data.heat_price_level.raw_data = heat.level;
-                            data.hw_price_level = {};
-                            data.hw_price_level.data = hw.level;
-                            data.hw_price_level.raw_data = hw.level;
-                            data.price_current.info = "Current electrical price / divided by 10"
-                            data.price_current.titel = "Electric price"
-                            data.price_current.register = "electric_price"
-                            data.price_current.unit = ""
-                            data.price_current.icon_name = "fa-flash"
-                            savedData['electric_price'] = data.price_current;
-                            saveDataGraph('electric_price',Date.now(),(data.price_current.raw_data/10))
-                            nibe.log(`Hämtad nivå: ${heat.level}, hämtat pris: ${data.price_current.data} öre`,'price','debug');
-                            var prio_add_enable = await getNibeData(hP['prio_add_enable']).catch((err) => {
+            } else if (config.price.source == "priceai") {
+                nibe.log(`Source is Home Assistant (Nord Pool) via HA entity ${HA_ENTITY}`, "price", "debug");
 
-                            })
-                            if(prio_add_enable!==undefined) {
-                            if(config.price.prio_enable===true) {
-                                if(config.price.prio_cop===undefined) {
-                                    config.price.prio_cop = 3
-                                    nibe.setConfig(config);
-                                }
-                                if(config.price.prio_cost===undefined) {
-                                    config.price.prio_cost = 1
-                                    nibe.setConfig(config);
-                                }
-                                if(config.price.prio_tax===undefined) {
-                                    config.price.prio_tax = 45
-                                    nibe.setConfig(config);
-                                }
-                                if(config.price.prio_transfer===undefined) {
-                                    config.price.prio_transfer = 25
-                                    nibe.setConfig(config);
-                                }
-                                nibe.log(`Prioriterad tillsats är aktiverad som elprisreglering`,'price','debug');
-                                let price = data.price_current.raw_data
-                                let fee = config.price.prio_tax+config.price.prio_transfer
-                                let cop = config.price.prio_cop
-                                let cost = config.price.prio_cost
-                                    if(price+fee > cost*cop) {
-                                        if(prio_add_enable.raw_data===0) {
-                                            nibe.log(`Elpriset har en högre kostnad att producera än prioriterad tillsats.`,'price','debug');
-                                            nibe.log(`Prioriterad tillsats är av, slår på`,'price','debug');
-                                            nibe.setData(hP['prio_add_enable'],1);
-                                            prio_add_enable.raw_data = 1
-                                            prio_add_enable.data = 1
-                                        }
-                                    } else {
-                                        if(prio_add_enable.raw_data===1) {
-                                            nibe.log(`Elpriset har en lägre kostnad att producera än prioriterad tillsats.`,'price','debug');
-                                            nibe.log(`Prioriterad tillsats är på, slår av`,'price','debug');
-                                            nibe.setData(hP['prio_add_enable'],0);
-                                            prio_add_enable.raw_data = 0
-                                            prio_add_enable.data = 0
-                                        }
-                                    }
-                                }
-                            }
-                            if(prio_add_enable===undefined || prio_add_enable.raw_data===0) {
-                                priceAdjustCurve(data)
-                                adjustPool(data,data.system)
-                                .then(pool => {
-                                    if(pool!==undefined) nibeData.emit('pluginPriceGraphPool',priceBuildPoolGraph(heat,data.system));
-                                })
-                                .catch(console.log)
-                            }
-                            
-                            nibeData.emit('pluginPrice',data);
-                            nibeData.emit('pluginPriceGraph',priceaiBuildGraph(heat,hw,data,prio_add_enable));
-                        })
-                    } catch(err) {
-                        console.log(err)
+                try {
+                    // 1) Fetch HA state once
+                    const haState = await fetchHAEntity(HA_ENTITY);
+                    const attrs   = haState && haState.attributes ? haState.attributes : {};
+
+                    // 2) Join raw_today + raw_tomorrow (raw_tomorrow can be [])
+                    const joined = []
+                        .concat(Array.isArray(attrs.raw_today)    ? attrs.raw_today    : [])
+                        .concat(Array.isArray(attrs.raw_tomorrow) ? attrs.raw_tomorrow : [])
+                        .filter(p => p && p.start && typeof p.value === "number");
+
+                    nibe.log(
+                        `HA Nord Pool: today=${Array.isArray(attrs.raw_today) ? attrs.raw_today.length : 0}, ` +
+                        `tomorrow=${Array.isArray(attrs.raw_tomorrow) ? attrs.raw_tomorrow.length : 0}, ` +
+                        `joined=${joined.length}`,
+                        "price", "debug"
+                    );
+
+                    if (joined.length === 0) {
+                        nibe.log("No price data available from HA (joined list is empty).", "price", "warn");
+                        return;
                     }
+
+                    // 3) Map to Tibber-like structure the rest of the code expects
+                    let fullPriceList = joined.map(p => ({ startsAt: p.start, total: p.value }));
+
+                    // 4) Sort and log window
+                    fullPriceList.sort((a, b) => new Date(a.startsAt) - new Date(b.startsAt));
+                    const first = fullPriceList[0];
+                    const last  = fullPriceList[fullPriceList.length - 1];
+                    nibe.log(`Price window: ${first.startsAt} → ${last.startsAt}`, "price", "debug");
+
+                    // 5) Determine current/next hour
+                    const now = new Date();
+                    now.setMinutes(0, 0, 0);
+                    const futurePriceList = fullPriceList.filter(p => new Date(p.startsAt) >= now);
+                    if (futurePriceList.length === 0) {
+                        nibe.log("No future price data available from HA.", "price", "warn");
+                        return;
+                    }
+
+                    nibe.log(`Future price points: ${futurePriceList.length}`, "price", "debug")
+
+                    const currentHour      = futurePriceList[0];
+                    const currentHourDate  = currentHour.startsAt;
                     
+
+                    // 6) Feed optimization (expects cents/öre scale)
+                    const priceDataForAlgo = fullPriceList.map(p => ({
+                        value: p.total * PRICE_TO_CENTS_MULTIPLIER,
+                        ts:    new Date(p.startsAt).getTime(),
+                        date:  p.startsAt
+                    }));
+
+                    const algoOptions  = {
+                        timeWindow: config.price.time,
+                        minSpread:  config.price.min_spread
+                    };
+                    const optimalTrades = optimizeElectricityTrading(priceDataForAlgo, algoOptions);
+
+                    // 7) Classify CHEAP/EXPENSIVE buckets
+                    let currentLevel = "NORMAL";
+                    let veryCheapHours, cheapHours, expensiveHours, veryExpensiveHours;
+
+                    if (optimalTrades.buy.length > 0) {
+                        const buyPrices  = optimalTrades.buy.sort((a, b) => a.value - b.value);
+                        const sellPrices = optimalTrades.sell.sort((a, b) => a.value - b.value);
+                        const buyMedianIndex  = Math.floor(buyPrices.length  / 2);
+                        const sellMedianIndex = Math.floor(sellPrices.length / 2);
+
+                        veryCheapHours     = new Set(buyPrices.slice(0, buyMedianIndex).map(p => p.date));
+                        cheapHours         = new Set(buyPrices.slice(buyMedianIndex).map(p => p.date));
+                        expensiveHours     = new Set(sellPrices.slice(0, sellMedianIndex).map(p => p.date));
+                        veryExpensiveHours = new Set(sellPrices.slice(sellMedianIndex).map(p => p.date));
+
+                        if (veryCheapHours.has(currentHourDate))           currentLevel = "VERY_CHEAP";
+                        else if (cheapHours.has(currentHourDate))          currentLevel = "CHEAP";
+                        else if (veryExpensiveHours.has(currentHourDate))  currentLevel = "VERY_EXPENSIVE";
+                        else if (expensiveHours.has(currentHourDate))      currentLevel = "EXPENSIVE";
+                    }
+
+                    // 8) Compose heat/hw payloads
+                    const heat = {
+                        level:   currentLevel,
+                        current: currentHour.total * PRICE_TO_CENTS_MULTIPLIER,
+                        prices:  fullPriceList.map(p => {
+                            const date = p.startsAt;
+                            let hourLevel = "NORMAL";
+                            if (veryCheapHours && veryCheapHours.has(date))              hourLevel = "VERY_CHEAP";
+                            else if (cheapHours && cheapHours.has(date))                 hourLevel = "CHEAP";
+                            else if (veryExpensiveHours && veryExpensiveHours.has(date)) hourLevel = "VERY_EXPENSIVE";
+                            else if (expensiveHours && expensiveHours.has(date))         hourLevel = "EXPENSIVE";
+
+                            return {
+                                value: p.total * PRICE_TO_CENTS_MULTIPLIER,
+                                level: hourLevel,
+                                ts:    new Date(p.startsAt).getTime()
+                            };
+                        })
+                    };
+
+                    const hw = { ...heat };
+
+                    // 9) Populate data + log summary
+                    data.priceai = { heat, hw };
+                    data.price_current = {
+                        data:      Number((heat.current).toFixed(2)),
+                        raw_data:  Number((heat.current).toFixed(2)),
+                        info:      "Current electrical price",
+                        titel:     "Electric price",
+                        register:  "electric_price",
+                        unit:      "cents", // or "öre" if your multiplier is for SEK
+                        icon_name: "fa-flash"
+                    };
+                    data.heat_price_level = { data: heat.level, raw_data: heat.level };
+                    data.hw_price_level   = { data: hw.level,   raw_data: hw.level   };
+
+                    nibe.log(
+                        `HA/Nord Pool analysis complete. Level: ${heat.level}, ` +
+                        `Price: ${data.price_current.data} (multiplier=${PRICE_TO_CENTS_MULTIPLIER})`,
+                        "price", "debug"
+                    );
+
+                    // 10) Keep the rest identical to old flow
+                    let prio_add_enable = await getNibeData(hP['prio_add_enable']).catch(() => {});
+                    if (prio_add_enable === undefined || prio_add_enable.raw_data === 0) {
+                        priceAdjustCurve(data);
+                        adjustPool(data, data.system)
+                            .then(pool => {
+                                if (pool !== undefined) {
+                                    nibeData.emit('pluginPriceGraphPool', priceBuildPoolGraph(heat, data.system));
+                                }
+                            })
+                            .catch(console.log);
+                    }
+
+                    nibeData.emit('pluginPrice', data);
+                    nibeData.emit('pluginPriceGraph', priceaiBuildGraph(heat, hw, data, prio_add_enable));
+
+                } catch (err) {
+                    nibe.log(`Error fetching/analysing from HA: ${err}`, "price", "error");
+                    console.log(err);
                 }
             }
         }
         
     }
+    
+    ///////##########################################################
+    // ##################################################################
+    // # START: Algoritm från energy.anerdins-iot.se (ORIGINAL-LOGIK)   #
+    // ##################################################################
+
+    function findTradingOpportunities(sortedPrices, originalData, config) {
+        const opportunities = [];
+
+        for (const lowPoint of sortedPrices) {
+            let buyIndex = -1;
+            for (let j = 0; j < originalData.length; j++) {
+                if (lowPoint.ts === originalData[j].ts) {
+                    buyIndex = j;
+                    break;
+                }
+            }
+
+            if (buyIndex === -1) continue;
+
+            const endIndex = Math.min(buyIndex + config.timeWindow, originalData.length);
+
+            for (let sellIndex = buyIndex + 1; sellIndex < endIndex; sellIndex++) {
+                const spread = originalData[sellIndex].value - lowPoint.value;
+
+                if (spread > config.minSpread) {
+                    opportunities.push({
+                        buy: lowPoint,
+                        sell: originalData[sellIndex],
+                        spread: spread
+                    });
+                }
+            }
+        }
+        const sortedOpportunities = opportunities.sort((a, b) => b.spread - a.spread);
+        if (sortedOpportunities.length > 0) {
+            nibe.log(`[DEBUG] Bästa funna affär: Köp för ${sortedOpportunities[0].buy.value.toFixed(2)} öre, Sälj för ${sortedOpportunities[0].sell.value.toFixed(2)} öre, Spread: ${sortedOpportunities[0].spread.toFixed(2)} öre`, 'price', 'debug');
+        }
+        return sortedOpportunities;
+    }
+
+
+
+    /**
+     * Hittar den optimala kombinationen av handelsmöjligheter (ORIGINAL-VERSION)
+     * @private
+     */
+    function findOptimalCombination(opportunities) {
+        if (opportunities.length === 0) return [];
+
+        const combinations = [];
+
+        // För varje möjlighet, bygg en kombination av icke-överlappande handel
+        for (let i = 0; i < opportunities.length; i++) {
+            const combination = [opportunities[i]];
+
+            for (let j = 0; j < opportunities.length; j++) {
+                if (i === j) continue;
+
+                // Kontrollerar om en affär överlappar med någon i den nuvarande kombinationen
+                const hasConflict = combination.some(trade =>
+                    trade.buy.ts === opportunities[j].buy.ts ||
+                    trade.sell.ts === opportunities[j].sell.ts ||
+                    trade.buy.ts === opportunities[j].sell.ts ||
+                    trade.sell.ts === opportunities[j].buy.ts
+                );
+
+                if (!hasConflict) {
+                    combination.push(opportunities[j]);
+                }
+            }
+
+            const totalProfit = combination.reduce((sum, trade) => sum + trade.spread, 0);
+            combinations.push({
+                trades: combination,
+                totalProfit: totalProfit
+            });
+        }
+
+        // Returnera kombinationen med högst total profit
+        combinations.sort((a, b) => b.totalProfit - a.totalProfit);
+        //return combinations[0]?.trades || [];
+        // KORRIGERING: Ersätter "combinations[0]?.trades" med en säkrare variant.
+        return combinations.length > 0 ? combinations[0].trades : [];
+    }
+
+
+    function formatResult(optimalTrades) {
+        const buyPoints = [];
+        const sellPoints = [];
+
+        for (const trade of optimalTrades) {
+            buyPoints.push(trade.buy);
+            sellPoints.push(trade.sell);
+        }
+
+        return {
+            buy: buyPoints,
+            sell: sellPoints
+        };
+    }
+
+
+    function optimizeElectricityTrading(priceData, options = {}) {
+        if (!Array.isArray(priceData) || priceData.length === 0) {
+            return { buy: [], sell: [] };
+        }
+
+        const config = {
+            timeWindow: Number(options.timeWindow) || 12,
+            // KORRIGERAD: Använder 20 (ören) som standard, enligt originalet.
+            minSpread: Number(options.minSpread) || 20
+        };
+
+        const sortedByPrice = [...priceData].sort((a, b) => a.value - b.value);
+        const totalSpread = sortedByPrice[sortedByPrice.length - 1].value - sortedByPrice[0].value;
+
+        if (totalSpread <= config.minSpread) {
+            return { buy: [], sell: [] };
+        }
+
+        const tradingOpportunities = findTradingOpportunities(
+            sortedByPrice,
+            priceData,
+            config
+        );
+
+        if (tradingOpportunities.length === 0) {
+            return { buy: [], sell: [] };
+        }
+
+        const optimalCombination = findOptimalCombination(tradingOpportunities);
+        return formatResult(optimalCombination);
+    }
+
+    // ##################################################################
+    // # SLUT: Algoritm                                                 #
+    // ##################################################################
+
+
+
+    async function runPrice(data,array) {
+
+        nibe.log(`Startar elprisreglering runPrice()`,'price','debug');
+        let config = nibe.getConfig();
+        let inside;
+        nibe.log(`Letar efter givare ${config.price['sensor_'+data.system]}`,'price','debug');
+        if(config.price['sensor_'+data.system]!==undefined && config.price['sensor_'+data.system]!=="") {
+            let index = array.findIndex(i => i.name == config.price['sensor_'+data.system]);
+            if(index!==-1) {
+                inside = array[index];
+                nibe.log(`Sätter inomhusgivare ${config.price['sensor_'+data.system]}, ${inside.data} grader`,'price','debug');
+            }
+        }
+        data.priceSensor = inside;
+        if(config.price!==undefined && config.price.enable===true) {
+            nibe.log(`Elprisreglering är aktiverad`,'price','debug');
+            if(config.price.source=="tibber") {
+                nibe.log(`Källan är Tibber`,'price','debug');
+
+                if(config.price.token!==undefined && config.price.token!=="") {
+                    let token = config.price.token;
+                    const options = {
+                        hostname: 'api.tibber.com',
+                        port: 443,
+                        path: '/v1-beta/gql',
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${token}`,
+                            'Content-Type': 'application/json'
+                        }
+                    };
+                    const request = JSON.stringify({
+                        query: "{\
+                            viewer {\
+                                homes {\
+                                currentSubscription {\
+                                    status\
+                                    priceInfo {\
+                                    today{\
+                                        startsAt\
+                                        total\
+                                        energy\
+                                        level\
+                                        tax\
+                                    }\
+                                    current{\
+                                        total\
+                                        energy\
+                                        level\
+                                        tax\
+                                        startsAt\
+                                    }\
+                                    tomorrow {\
+                                        startsAt\
+                                        total\
+                                        level\
+                                        energy\
+                                        tax\
+                                    }\
+                                    }\
+                                }\
+                                consumption(resolution: HOURLY, last: 48) {\
+                                    nodes {\
+                                    from\
+                                    to\
+                                    consumption\
+                                    consumptionUnit\
+                                    }\
+                                }\
+                                }\
+                            }\
+                            }"
+                        });
+                    await getCloudData(options,request).then(result => {
+                        data.tibber = result;
+                        data.price_current = {};
+                        data.price_current.data = Number((result.data.viewer.homes[config.price.tibber_home].currentSubscription.priceInfo.current.energy*100).toFixed(2))
+                        data.price_current.raw_data = Number((result.data.viewer.homes[config.price.tibber_home].currentSubscription.priceInfo.current.energy*100).toFixed(2))
+                        data.price_level = {};
+                        data.price_level.data = result.data.viewer.homes[config.price.tibber_home].currentSubscription.priceInfo.current.level;
+                        data.price_level.raw_data = result.data.viewer.homes[config.price.tibber_home].currentSubscription.priceInfo.current.level;
+                        priceAdjustCurve(data)
+                        nibeData.emit('pluginPrice',data);
+                        nibeData.emit('pluginPriceGraph',tibberBuildGraph(result,data.system));
+                    },(reject => {
+                        console.log(reject)
+                    }));
+                } else {
+                    sendError('Cloud',`Token är inte giltigt.`);
+                    return
+                }
+
+            } else if(config.price.source=="nibe") {
+                nibe.log(`Källan är Nibe`,'price','debug');
+                data.price_level = await getNibeData(hP['price_level']).catch(console.log);
+                data.price_enable = await getNibeData(hP['price_enable']).catch(console.log);
+                priceAdjustCurve(data)
+                data.price_current = await getNibeData(hP['price_current']).catch(console.log);
+                nibeData.emit('pluginPriceGraph',nibeBuildGraph(data,data.system));
+                nibeData.emit('pluginPrice',data);
+            } else if (config.price.source == "priceai") {
+                nibe.log(`Källan är Home Assistant (Nord Pool) via HA-entity ${HA_ENTITY}`,'price','debug');
+
+                try {
+                    const haState = await fetchHAEntity(HA_ENTITY);
+
+                    if (!haState || !haState.attributes || !Array.isArray(haState.attributes.raw_all)) {
+                        sendError('Lokal AI', 'Kunde inte läsa attributes.raw_all från Home Assistant.');
+                        return;
+                    }
+
+                    // Build Tibber-like structure from HA raw_all
+                    // raw_all[i] = { start: ISO, end: ISO, value: number (EUR/kWh in your sample) }
+                    const fullPriceList = haState.attributes.raw_all
+                    .filter(p => p && p.start && typeof p.value === "number")
+                    .map(p => ({ startsAt: p.start, total: p.value })); // total == price per kWh
+
+                    if (fullPriceList.length === 0) {
+                        nibe.log('Ingen prisdata alls tillgänglig från HA.', 'price', 'warn');
+                        return;
+                    }
+
+                    // Determine current hour (same style as Tibber branch)
+                    const now = new Date();
+                    now.setMinutes(0, 0, 0);
+                    const futurePriceList = fullPriceList.filter(p => new Date(p.startsAt) >= now);
+                    if (futurePriceList.length === 0) {
+                        nibe.log('Ingen framtida prisdata tillgänglig från HA.', 'price', 'warn');
+                        return;
+                    }
+                    const currentHour = futurePriceList[0];
+                    const currentHourDate = currentHour.startsAt;
+
+                    // Feed the optimization algo (expects "cents/öre" scale). We’ll multiply once here.
+                    const priceDataForAlgo = fullPriceList.map(p => ({
+                        value: p.total * PRICE_TO_CENTS_MULTIPLIER, // cents (or öre if you set multiplier accordingly)
+                        ts: new Date(p.startsAt).getTime(),
+                        date: p.startsAt
+                    }));
+
+                    const algoOptions = {
+                        timeWindow: config.price.time,
+                        minSpread: config.price.min_spread
+                    };
+                    const optimalTrades = optimizeElectricityTrading(priceDataForAlgo, algoOptions);
+
+                    // Classify levels from the algo (VERY_CHEAP/CHEAP/NORMAL/EXPENSIVE/VERY_EXPENSIVE)
+                    let currentLevel = 'NORMAL';
+                    let veryCheapHours, cheapHours, expensiveHours, veryExpensiveHours;
+
+                    if (optimalTrades.buy.length > 0) {
+                        const buyPrices  = optimalTrades.buy.sort((a, b) => a.value - b.value);
+                        const sellPrices = optimalTrades.sell.sort((a, b) => a.value - b.value);
+                        const buyMedianIndex  = Math.floor(buyPrices.length  / 2);
+                        const sellMedianIndex = Math.floor(sellPrices.length / 2);
+
+                        veryCheapHours     = new Set(buyPrices.slice(0, buyMedianIndex).map(p => p.date));
+                        cheapHours         = new Set(buyPrices.slice(buyMedianIndex).map(p => p.date));
+                        expensiveHours     = new Set(sellPrices.slice(0, sellMedianIndex).map(p => p.date));
+                        veryExpensiveHours = new Set(sellPrices.slice(sellMedianIndex).map(p => p.date));
+
+                        if (veryCheapHours.has(currentHourDate))       currentLevel = 'VERY_CHEAP';
+                        else if (cheapHours.has(currentHourDate))      currentLevel = 'CHEAP';
+                        else if (veryExpensiveHours.has(currentHourDate)) currentLevel = 'VERY_EXPENSIVE';
+                        else if (expensiveHours.has(currentHourDate))  currentLevel = 'EXPENSIVE';
+                    }
+
+                    // Compose heat/hw like the old cloud did, so the rest of the code can stay the same
+                    const heat = {
+                        level: currentLevel,
+                        current: currentHour.total * PRICE_TO_CENTS_MULTIPLIER,
+                        prices: fullPriceList.map(p => {
+                            const date = p.startsAt;
+                            let hourLevel = 'NORMAL';
+                            if (veryCheapHours && veryCheapHours.has(date))          hourLevel = 'VERY_CHEAP';
+                            else if (cheapHours && cheapHours.has(date))             hourLevel = 'CHEAP';
+                            else if (veryExpensiveHours && veryExpensiveHours.has(date)) hourLevel = 'VERY_EXPENSIVE';
+                            else if (expensiveHours && expensiveHours.has(date))     hourLevel = 'EXPENSIVE';
+
+                            return { value: p.total * PRICE_TO_CENTS_MULTIPLIER, level: hourLevel, ts: new Date(p.startsAt).getTime() };
+                        })
+                    };
+
+                    const hw = { ...heat };
+
+                    data.priceai = { heat, hw };
+                    data.price_current = {
+                        data: Number((heat.current).toFixed(2)),
+                        raw_data: Number((heat.current).toFixed(2)),
+                        info: "Current electrical price",
+                        titel: "Electric price",
+                        register: "electric_price",
+                        unit: "cents", // or "öre" if you set the multiplier for SEK
+                        icon_name: "fa-flash"
+                    };
+                    data.heat_price_level = { data: heat.level, raw_data: heat.level };
+                    data.hw_price_level   = { data: hw.level,   raw_data: hw.level   };
+
+                    nibe.log(`HA/Nord Pool analys klar. Nivå: ${heat.level}, Pris: ${data.price_current.data} (multiplier=${PRICE_TO_CENTS_MULTIPLIER})`, 'price', 'debug');
+
+                    // Keep the rest identical to old flow
+                    let prio_add_enable = await getNibeData(hP['prio_add_enable']).catch(() => {});
+                    if (prio_add_enable === undefined || prio_add_enable.raw_data === 0) {
+                        priceAdjustCurve(data);
+                        adjustPool(data, data.system)
+                        .then(pool => {
+                            if (pool !== undefined) nibeData.emit('pluginPriceGraphPool', priceBuildPoolGraph(heat, data.system));
+                        })
+                        .catch(console.log);
+                    }
+
+                    nibeData.emit('pluginPrice', data);
+                    nibeData.emit('pluginPriceGraph', priceaiBuildGraph(heat, hw, data, prio_add_enable));
+
+                } catch (err) {
+                    nibe.log(`Fel vid hämtning/analys från HA: ${err}`, 'price', 'error');
+                    console.log(err);
+                }
+            }
+        }
+    }
+
     const sendError = (from,message) => {
         let data = {from:from,message:message};
         nibeData.emit('fault',data);

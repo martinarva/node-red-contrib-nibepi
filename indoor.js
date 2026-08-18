@@ -40,7 +40,19 @@ module.exports = function(RED) {
                 }
             }
             let nibe_enabled = await server.nibe.reqData(server.hP()["inside_enable_"+config.system]).catch(console.log);
-            if(nibe_enabled===undefined || nibe_enabled.data===undefined || nibe_enabled.data!==1 && conf.indoor['enable_'+config.system]!==true){ arr = [];}
+            // NIBEPI_PATCHED_INDOOR: startup race. reqData throws "Core is not
+              // started", .catch swallows it and returns undefined -> the first
+              // condition emptied arr and disabled the indoor plugin PERMANENTLY
+              // for that session, even though the config says enable=true.
+              // Consequence: 47394 stays 0, the pump ignores the room sensor and
+              // BT50 freezes. Retry instead of giving up.
+              if((nibe_enabled===undefined || nibe_enabled.data===undefined)
+                 && conf.indoor['enable_'+config.system]===true) {
+                  console.log("Indoor S"+config.system+": core was not ready, retrying in 15s");
+                  setTimeout(startUp, 15000);
+                  return;
+              }
+              if(nibe_enabled===undefined || nibe_enabled.data===undefined || nibe_enabled.data!==1 && conf.indoor['enable_'+config.system]!==true){ arr = [];}
                 server.initiatePlugin(arr,'indoor',config.system).then(data => {
                     node.status({ fill: 'green', shape: 'dot', text: `System ${system}` });
                     node.send({enabled:true});
