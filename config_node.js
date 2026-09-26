@@ -336,8 +336,12 @@ module.exports = function(RED) {
                                         }
                                     }
                                     }
+                                    resolve(true)
                                 }
-                                resolve(true)
+                                // NIBEPI_PATCHED_REGISTRY: resolve only when S1 really is in getList.
+                                // Upstream resolved outside this if, so the RMU node turned green
+                                // whenever register 10020 was readable - even with an empty registry,
+                                // when nothing was ever going to be written to the pump.
                             } else {
                                 return reject(false); 
                             }
@@ -495,6 +499,43 @@ module.exports = function(RED) {
     });
     return promise;
 }
+    // NIBEPI_PATCHED_REGISTRY: registration (initiatePlugin) happens once at startup
+    // and depends on one live read of supply_sN, which regularly times out while
+    // nibepi fires ~90 startup reads at a pump that answers one at a time. When it
+    // failed nothing retried, getList stayed empty and updateData() looped over
+    // nothing - RMU, indoor and weather silently dead until the next restart. Every
+    // cycle now checks that each enabled plugin is really registered and asks the
+    // plugin nodes to register again if not. The first check waits 5 minutes, so
+    // the normal startup registration gets a chance to finish on its own.
+    let registryHealedAt = Date.now();
+    function checkPluginRegistry() {
+        const conf = nibe.getConfig();
+        const s1 = getList.find(s => s.system === 's1');
+        const registered = (plugin) => s1 !== undefined && s1.registers.some(r => Array.isArray(r.plugin) && r.plugin.includes(plugin));
+        const missing = [];
+        if(conf.rmu!==undefined && conf.rmu.sensor_s1!==undefined && conf.rmu.sensor_s1!=="" && conf.rmu.sensor_s1!=="Ingen" && !registered('rmu')) missing.push('rmu');
+        if(conf.indoor!==undefined && conf.indoor.enable_s1===true && !registered('indoor')) missing.push('indoor');
+        if(conf.weather!==undefined && conf.weather.enable_s1===true && !registered('weather')) missing.push('weather');
+        if(missing.length===0) return;
+        if(Date.now()-registryHealedAt < 5*60000) return;
+        registryHealedAt = Date.now();
+        console.log(`Plugin registry incomplete, not registered for S1: ${missing.join(', ')}. Asking plugins to register again.`);
+        nibeData.emit('pluginReinit');
+    }
+    // NIBEPI_PATCHED_REGISTRY: runIndoor is synchronous and throws on a missing
+    // register (inside_set.data after one read timed out). That aborted the whole
+    // cycle, so runRMU never ran, and the error escaped the cron callback as an
+    // unhandled rejection - which kills Node-RED on Node >= 15 (it did on 23.09 and
+    // 25.09). Each plugin now runs on its own and a failure is only logged.
+    function runPluginSafe(name, fn) {
+        const report = (err) => console.log(`Plugin ${name} failed: ${err && err.stack ? err.stack.split('\n').slice(0,4).join(' | ') : err}`);
+        try {
+            const result = fn();
+            if(result!==undefined && result!==null && typeof result.catch==='function') result.catch(report);
+        } catch(err) {
+            report(err);
+        }
+    }
     async function updateData(hourly=false) {
         let timeNow = Date.now();
         /*
@@ -515,10 +556,18 @@ module.exports = function(RED) {
             result.indoorOffset = indoorOffset[item.system];
             result.weatherOffset = weatherOffset[item.system];
             result.priceOffset = priceOffset[item.system];
-            for( var i = 0; i < item.registers.length; i++){
-                if(item.registers[i].source!==undefined) {
-                    if(item.registers[i].source=="mqtt") {
-                        await nibe.getMQTTData(item.registers[i].register).then(atad => {
+            // NIBEPI_PATCHED_SNAPSHOT: walk a snapshot and bind each entry BEFORE the
+            // await. Upstream re-read reg inside the callbacks, i.e. after a
+            // read that can take seconds; if plugins re-registered in the meantime the list
+            // had shifted and a value got another entry's name. On 26.09 exhaust (40025,
+            // always -3276.8 on this pump) came out labelled living_room, and runRMU wrote
+            // -3276.8 to the pump as the room temperature.
+            const regs = item.registers.slice();
+            for( var i = 0; i < regs.length; i++){
+                const reg = regs[i];
+                if(reg.source!==undefined) {
+                    if(reg.source=="mqtt") {
+                        await nibe.getMQTTData(reg.register).then(atad => {
                             let data = Object.assign({}, atad);
                             let config = nibe.getConfig();
                             let sensor_timeout;
@@ -534,39 +583,39 @@ module.exports = function(RED) {
                                 sensor_timeout = data.timestamp+(60*60000);
                             }
                             if(timeNow>sensor_timeout) {
-                                sendError(text.extra_sensor,`${text.extra_sensor} ${item.registers[i].name} ${text.not_updated}`)
+                                sendError(text.extra_sensor,`${text.extra_sensor} ${reg.name} ${text.not_updated}`)
                             } else {
                                 data.system = item.system;
                                 data.timestamp = timeNow;
-                                data.name = item.registers[i].name;
-                                data.topic = item.registers[i].register;
-                                result[item.registers[i].register] = data;
+                                data.name = reg.name;
+                                data.topic = reg.register;
+                                result[reg.register] = data;
                                 array.push(data)
                             }
                             
                         },(error => {
-                            sendError(text.extra_sensor,`${text.extra_sensor} ${item.registers[i].name} ${text.no_values}`)
+                            sendError(text.extra_sensor,`${text.extra_sensor} ${reg.name} ${text.no_values}`)
                         }));
-                    } else if(item.registers[i].source=="tibber") {
+                    } else if(reg.source=="tibber") {
                         console.log('Tibber Data request');
-                    } else if(item.registers[i].source=="nibe") {
-                            await getNibeData(item.registers[i].register).then(atad => {
+                    } else if(reg.source=="nibe") {
+                            await getNibeData(reg.register).then(atad => {
                                 let data = Object.assign({}, atad);
                                 data.system = item.system;
-                                data.name = item.registers[i].name;
-                                data.topic = item.registers[i].topic;
-                                result[item.registers[i].topic] = data;
+                                data.name = reg.name;
+                                data.topic = reg.topic;
+                                result[reg.topic] = data;
                                 array.push(data)
                             }).catch(console.log)
                     }
                 }
             }
-            runIndoor(result,array);
-            runPrice(result,array);
-            runRMU(result,array);
+            runPluginSafe('indoor', () => runIndoor(result,array));
+            runPluginSafe('price', () => runPrice(result,array));
+            runPluginSafe('rmu', () => runRMU(result,array));
             if(hourly===true) {
                 result.array = array;
-                runWeather(result);
+                runPluginSafe('weather', () => runWeather(result));
             } else {
                 result.array = array;
                 if(nibe.getConfig().weather['enable_'+item.system]===true) {
@@ -575,6 +624,9 @@ module.exports = function(RED) {
             }
             nibeData.emit('updateGraph');
         }
+        // NIBEPI_PATCHED_SNAPSHOT: check the registry after this cycle's reads, so a
+        // re-registration never starts while this cycle is still walking the list.
+        checkPluginRegistry();
       }
         const checkWind = (array,hours) => {
         var output = {};
@@ -659,6 +711,39 @@ module.exports = function(RED) {
           }
             return output;
         }
+    // NIBEPI_PATCHED_SNOW1G: SMHI retired the pmp3g/v2 point forecast (404 on every
+    // URL, verified 2026-09-26), so forecast control could not work at all. snow1g/v1
+    // carries the same data under new names; convert it to the old shape so the
+    // forecast logic below stays untouched. symbol_code is documented as Wsymb2 (same
+    // 27 codes) and 9999 marks a missing value. Anything unexpected returns undefined,
+    // which takes the existing "provider not responding" path (offset 0).
+    const snow1gToPmp3g = (body, hours) => {
+        try {
+            const series = JSON.parse(body).timeSeries;
+            const h = Number(hours);
+            const needed = Math.max(49, isNaN(h) ? 0 : h+1);
+            if(!Array.isArray(series) || series.length < needed) {
+                console.log(`Weather forecast: SMHI returned ${Array.isArray(series) ? series.length : 'no'} time steps, need ${needed}`);
+                return undefined;
+            }
+            const fields = {t:'air_temperature', ws:'wind_speed', wd:'wind_from_direction', gust:'wind_speed_of_gust', Wsymb2:'symbol_code'};
+            const timeSeries = series.map(entry => ({
+                validTime: entry.time,
+                parameters: Object.keys(fields).map(name => ({name:name, values:[entry.data!==undefined ? entry.data[fields[name]] : undefined]}))
+            }));
+            for(let i = 0; i < needed; i++) {
+                const bad = timeSeries[i].parameters.find(p => typeof p.values[0]!=='number' || isNaN(p.values[0]) || p.values[0]===9999);
+                if(bad!==undefined || typeof timeSeries[i].validTime!=='string') {
+                    console.log(`Weather forecast: SMHI step ${i} has no valid ${bad!==undefined ? bad.name : 'time'}`);
+                    return undefined;
+                }
+            }
+            return {timeSeries:timeSeries};
+        } catch(err) {
+            console.log(`Weather forecast: could not read the SMHI response: ${err.message}`);
+            return undefined;
+        }
+    }
     const runWeather = async (val) => {
         nibe.log(`Startar Prognosreglering`,'weather','debug');
         let timeNow = Date.now();
@@ -690,13 +775,17 @@ module.exports = function(RED) {
             let lat = config.home.lat;
             nibe.log(`Koordinater: (Latitud: ${config.home.lat}, Longitud: ${config.home.lon})`,'weather','debug');
             if(lon!==undefined && lat!==undefined && lon!="" && lat!="") {
-                https.get(`https://opendata-download-metfcst.smhi.se/api/category/pmp3g/version/2/geotype/point/lon/${lon}/lat/${lat}/data.json`, (resp) => {
+                https.get(`https://opendata-download-metfcst.smhi.se/api/category/snow1g/version/1/geotype/point/lon/${lon}/lat/${lat}/data.json`, (resp) => {
                     let data = '';
                     resp.on('data', (chunk) => {
                     data += chunk;
                     });
                     resp.on('end', () => {
-                        if(resp.statusCode===200) {
+                        // NIBEPI_PATCHED_SNOW1G: this runs in an https callback, where a throw is an
+                        // uncaught exception that restarts Node-RED, so the whole handler is guarded.
+                        try {
+                        const forecast = resp.statusCode===200 ? snow1gToPmp3g(data, config.home['hours_'+val.system]) : undefined;
+                        if(forecast!==undefined) {
                             let hours = config.home['hours_'+val.system];
                             let time = Number((Date.now()).toFixed())+(hours*3600000);
                             const astro = suncalc({lat:lat,lon:lon,timestamp:time})
@@ -711,7 +800,7 @@ module.exports = function(RED) {
                                 nibe.log(`När prognosen infaller är det inte dag.`,'weather','debug');
                                 sun = false;
                             }
-                            data = JSON.parse(data);
+                            data = forecast;
                             let wind = checkWind(data.timeSeries,hours);
                             let windSet = wind.feel;
                             var tempPredicted = data.timeSeries[hours].parameters.find(tempPredicted => tempPredicted.name == "t");
@@ -811,6 +900,9 @@ module.exports = function(RED) {
                                 weatherOffset[val.system] = 0;
                             }
                             saveDataGraph('weather_offset_'+val.system,timeNow,0,true);
+                        }
+                        } catch(err) {
+                            console.log(`Weather forecast control failed: ${err && err.stack ? err.stack.split('\n').slice(0,4).join(' | ') : err}`);
                         }
                     });
                 
@@ -2891,6 +2983,12 @@ async function runRMU(result,array) {
         let register = nibe.getRegister();
         let sensor = register.find(index => index.register == hP['rmu_sensor_s'+i]);
         if(sensor!==undefined && sensor.mode=="R/W") {
+            // NIBEPI_PATCHED_SNAPSHOT: never forward an implausible room temperature
+            // (-3276.8 is Nibe's "no sensor" value) - skipping one write is harmless.
+            if(inside!==undefined && (typeof inside.data!=="number" || isNaN(inside.data) || inside.data < -30 || inside.data > 60)) {
+                console.log(`RMU40 System ${i}: not writing implausible room temperature ${inside.data} (${inside.name})`);
+                inside = undefined;
+            }
             if(inside!==undefined) {
                 nibe.setData(hP['rmu_sensor_s'+i],inside.data);
             } else {

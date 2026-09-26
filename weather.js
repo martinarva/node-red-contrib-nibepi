@@ -48,6 +48,11 @@ module.exports = function(RED) {
                 startUp();
             })
         }
+        // NIBEPI_PATCHED_REGISTRY: config_node emits this when the plugin is enabled
+        // but missing from the registry, i.e. its startup registration failed.
+        server.nibeData.on('pluginReinit', () => {
+            startUp();
+        })
         this.on('input', function(msg) {
             let conf = server.nibe.getConfig();
             if(msg.topic=="update") {
