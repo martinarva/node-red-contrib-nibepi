@@ -869,6 +869,28 @@ module.exports = function(RED) {
                                     val.predictedNow = {payload:tempNow.values[0],timestamp:toTimestamp(data.timeSeries[0].validTime)};
                                     val.predictedLater = {payload:tempPredicted,timestamp:toTimestamp(data.timeSeries[hours].validTime)};
                                     saveDataGraph('weather_forecast_'+val.system,toTimestamp(data.timeSeries[hours].validTime),tempPredicted,true);
+                                    // NIBEPI_PATCHED_FORECAST_CURVE: upstream stored one point per hourly run
+                                    // (the forecast `hours` ahead), so after a restart the forecast chart was a
+                                    // single point and took `hours` hours to fill in. Every run now replaces the
+                                    // future part of both forecast series with the whole current forecast up to
+                                    // `hours` ahead, so the chart always shows the latest forecast and rolls
+                                    // forward each hour. Past points are left as they were.
+                                    {
+                                        const now = Date.now();
+                                        const adjust = config.weather.forecast_adjust===true;
+                                        const shift = adjust ? outside-tempNow.values[0] : 0;
+                                        const raw = [], adjusted = [];
+                                        for(let i = 0; i <= hours && i < data.timeSeries.length; i++) {
+                                            const x = toTimestamp(data.timeSeries[i].validTime);
+                                            if(x <= now) continue;
+                                            const t = data.timeSeries[i].parameters.find(p => p.name == "t").values[0];
+                                            raw.push({x:x, y:t});
+                                            adjusted.push({x:x, y:Number((t+shift).toFixed(2))});
+                                        }
+                                        const past = (name) => (savedGraph[name] || []).filter(p => p.x <= now);
+                                        savedGraph['weather_forecast_'+val.system] = past('weather_forecast_'+val.system).concat(adjusted);
+                                        if(adjust) savedGraph['weather_unfilterd_'+val.system] = past('weather_unfilterd_'+val.system).concat(raw);
+                                    }
                                     nibe.log(`Sparar värde för prognos. (${tempPredicted} grader)`,'weather','debug');
                                     saveDataGraph('weather_offset_'+val.system,timeNow,val.weatherOffset,true);
                                     nibe.log(`Sparar värde för kurvjustering. (${val.weatherOffset})`,'weather','debug');

@@ -142,3 +142,19 @@ The stock dashboard button "Starta om Node-RED" runs `sudo service nodered resta
 which silently does nothing in a container. Under Docker use `kill -TERM 1` instead:
 the image's entrypoint traps SIGTERM, stops Node-RED cleanly and exits, and a
 `restart: unless-stopped` policy starts the container again about two seconds later.
+
+## config_node.js — rolling forecast curve  (`NIBEPI_PATCHED_FORECAST_CURVE`)
+
+**The forecast chart took half a day to fill after every restart.** Each hourly
+run stored one point per series — the forecast `hours` ahead — so right after a
+restart "Prognos" and "Ojusterad Prognos" were a single point, drawn as a flat
+line, and only after `hours` hours of uninterrupted running did they cover the
+whole period ahead. On the original Raspberry Pi that went unnoticed, because it
+ran for weeks between restarts.
+
+Every run now replaces the future part of both series with the whole current
+forecast, one point per hour up to `hours` ahead, so the chart always shows the
+latest forecast and rolls forward each hour. Points already in the past are left
+untouched; for those hours the series now holds the last forecast made before the
+hour arrived, where upstream held the one made `hours` earlier. The value the
+controller acts on (`hours` ahead) is the last point of the curve, as before.
